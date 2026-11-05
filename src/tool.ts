@@ -1,5 +1,4 @@
 import { realpath, stat } from "node:fs/promises"
-import { isAbsolute, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import type { LspClient } from "./client.ts"
 import {
@@ -11,7 +10,7 @@ import {
   formatLocations,
   formatWorkspaceSymbols,
 } from "./format.ts"
-import { requestWithRetry, within, type LspManager } from "./manager.ts"
+import { projectPath, requestWithRetry, within, type LspManager } from "./manager.ts"
 
 const OPERATIONS = [
   "goToDefinition",
@@ -149,8 +148,7 @@ function callItems(items: unknown[], root: string): string[] {
 }
 
 async function resolveFile(root: string, value: string): Promise<string> {
-  const path = value.replace(/^@/, "")
-  const file = isAbsolute(path) ? resolve(path) : resolve(root, path)
+  const file = projectPath(root, value)
   // OpenCode 1 asked before touching files outside the project; plugins cannot ask, so refuse.
   // Symlinks are resolved too, so a link inside the project cannot reach outside it.
   const outside = new Error(`${value} is outside the project directory ${root}.`)

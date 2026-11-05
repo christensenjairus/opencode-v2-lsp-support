@@ -18,8 +18,44 @@ export interface Diagnostic {
   readonly message: string
 }
 
+const MAX_HEADER = 8 * 1024
+const MAX_BODY = 16 * 1024 * 1024
+
+export function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function position(value: unknown): boolean {
+  const item = record(value)
+  return !!item && Number.isSafeInteger(item.line) && (item.line as number) >= 0
+    && Number.isSafeInteger(item.character) && (item.character as number) >= 0
+}
+
+export function diagnostics(value: unknown): Diagnostic[] {
+  if (!Array.isArray(value) || !value.every((item: unknown) => {
+    const diagnostic = record(item)
+    const range = record(diagnostic?.range)
+    return !!diagnostic && !!range && position(range.start) && position(range.end)
+      && typeof diagnostic.message === "string"
+      && (diagnostic.severity === undefined || [1, 2, 3, 4].includes(diagnostic.severity as number))
+      && (diagnostic.code === undefined || typeof diagnostic.code === "string" || typeof diagnostic.code === "number")
+      && (diagnostic.source === undefined || typeof diagnostic.source === "string")
+  })) throw new Error("invalid diagnostic records")
+  return value as Diagnostic[]
+}
+
+export type DiagnosticReport = { kind: "full"; items: Diagnostic[] } | { kind: "unchanged" }
+
+function diagnosticReport(value: unknown): DiagnosticReport {
+  const report = record(value)
+  if (report?.kind === "full") return { kind: "full", items: diagnostics(report.items) }
+  if (report?.kind === "unchanged") return { kind: "unchanged" }
+  throw new Error("invalid diagnostic report")
+}
+
 interface Pending {
-  resolve: (value: any) => void
+  method: string
+  resolve: (value: unknown) => void
   reject: (error: Error) => void
   cleanup: () => void
 }
@@ -46,7 +82,7 @@ export interface ClientOptions {
   readonly onDiagnostics: (uri: string, diagnostics: Diagnostic[], version: number | undefined) => void
   /** Called for every message from the server. Diagnostics waits use it to tell when the server is busy. */
   readonly onActivity: () => void
-  readonly onExit: () => void
+  readonly onExit: (failure?: Error) => void
   readonly debug: boolean
 }
 
@@ -56,6 +92,10 @@ export class LspClient {
   readonly #options: ClientOptions
   #child?: ChildProcess
   #buffer: Buffer = Buffer.alloc(0)
+  #bodyLength?: number
+  #body: Buffer = Buffer.alloc(0)
+  #received = 0
+  #failed?: Error
   #nextId = 1
   #pending = new Map<number, Pending>()
   #capabilities: Record<string, any> = {}
@@ -70,8 +110,12 @@ export class LspClient {
     return this.#capabilities
   }
 
+  get failure(): Error | undefined {
+    return this.#failed
+  }
+
   get running(): boolean {
-    return !this.#stopping && this.#child !== undefined && this.#child.exitCode === null && this.#child.signalCode === null
+    return !this.#failed && !this.#stopping && this.#child !== undefined && this.#child.exitCode === null && this.#child.signalCode === null
   }
 
   async start(): Promise<void> {
@@ -122,21 +166,23 @@ export class LspClient {
       },
       this.#options.initializeTimeoutMs,
     )
-    this.#capabilities = result?.capabilities ?? {}
+    this.#capabilities = record(record(result)?.capabilities) ?? {}
     this.notify("initialized", {})
     if (this.#options.initialization) {
       this.notify("workspace/didChangeConfiguration", { settings: this.#options.initialization })
     }
   }
 
-  request(method: string, params: unknown, timeoutMs = this.#options.requestTimeoutMs, signal?: AbortSignal): Promise<any> {
+  request(method: "textDocument/diagnostic", params: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<DiagnosticReport>
+  request(method: string, params: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<unknown>
+  request(method: string, params: unknown, timeoutMs = this.#options.requestTimeoutMs, signal?: AbortSignal): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
         reject(signal.reason)
         return
       }
-      if (!this.#child) {
-        reject(new Error(`${this.id}: server is not running`))
+      if (this.#failed || !this.#child) {
+        reject(this.#failed ?? new Error(`${this.id}: server is not running`))
         return
       }
       const id = this.#nextId++
@@ -155,7 +201,7 @@ export class LspClient {
         clearTimeout(timer)
         signal?.removeEventListener("abort", abort)
       }
-      this.#pending.set(id, { resolve, reject, cleanup })
+      this.#pending.set(id, { method, resolve, reject, cleanup })
       signal?.addEventListener("abort", abort, { once: true })
       this.#send({ jsonrpc: "2.0", id, method, params })
     })
@@ -169,10 +215,12 @@ export class LspClient {
     if (this.#stopping) return
     this.#stopping = true
     const child = this.#child
-    if (child && child.exitCode === null) {
-      await this.request("shutdown", null, 2_000).catch(() => undefined)
-      this.#send({ jsonrpc: "2.0", method: "exit" })
-      await new Promise<void>((resolve) => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      if (!this.#failed) {
+        await this.request("shutdown", null, 2_000).catch(() => undefined)
+        this.#send({ jsonrpc: "2.0", method: "exit" })
+      }
+      if (child.exitCode === null && child.signalCode === null) await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
           child.kill("SIGKILL")
           resolve()
@@ -202,49 +250,86 @@ export class LspClient {
     stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`)
   }
 
+  #protocolError(error: unknown): void {
+    const failure = new Error(`${this.id}: protocol error: ${errorMessage(error)}`)
+    this.#failed = failure
+    this.#buffer = Buffer.alloc(0)
+    this.#body = Buffer.alloc(0)
+    this.#bodyLength = undefined
+    this.#received = 0
+    this.#rejectPending(failure)
+    if (this.#options.debug) console.error(failure.message)
+    this.#child?.kill("SIGKILL")
+  }
+
   #onData(chunk: Buffer): void {
-    this.#buffer = Buffer.concat([this.#buffer, chunk])
-    while (true) {
-      const separator = this.#buffer.indexOf("\r\n\r\n")
-      if (separator < 0) return
-      const header = this.#buffer.subarray(0, separator).toString("utf8")
-      const match = /Content-Length:\s*(\d+)/i.exec(header)
-      if (!match) {
-        this.#buffer = this.#buffer.subarray(separator + 4)
-        continue
-      }
-      const start = separator + 4
-      const end = start + Number(match[1])
-      if (this.#buffer.length < end) return
-      const body = this.#buffer.subarray(start, end).toString("utf8")
-      this.#buffer = this.#buffer.subarray(end)
-      try {
+    if (this.#failed) return
+    try {
+      while (true) {
+        if (this.#bodyLength === undefined) {
+          if (!chunk.length) return
+          const take = Math.min(chunk.length, MAX_HEADER + 4 - this.#buffer.length)
+          this.#buffer = Buffer.concat([this.#buffer, chunk.subarray(0, take)])
+          chunk = chunk.subarray(take)
+          const separator = this.#buffer.indexOf("\r\n\r\n")
+          if (separator < 0) {
+            if (this.#buffer.length >= MAX_HEADER + 4) throw new Error("header exceeds limit")
+            continue
+          }
+          const headers = this.#buffer.subarray(0, separator).toString("ascii").split("\r\n")
+          const lengths = headers.filter((line) => /^content-length:/i.test(line))
+          if (lengths.length !== 1 || !/^content-length: *[0-9]+ *$/i.test(lengths[0])) throw new Error("invalid Content-Length")
+          const length = Number(lengths[0].split(":")[1].trim())
+          if (!Number.isSafeInteger(length) || length > MAX_BODY) throw new Error("body exceeds limit")
+          chunk = Buffer.concat([this.#buffer.subarray(separator + 4), chunk])
+          this.#buffer = Buffer.alloc(0)
+          this.#bodyLength = length
+          this.#body = Buffer.allocUnsafe(length)
+        }
+        const take = Math.min(chunk.length, this.#bodyLength - this.#received)
+        chunk.copy(this.#body, this.#received, 0, take)
+        this.#received += take
+        chunk = chunk.subarray(take)
+        if (this.#received < this.#bodyLength) return
+        const body = this.#body.toString("utf8")
+        this.#bodyLength = undefined
+        this.#body = Buffer.alloc(0)
+        this.#received = 0
         this.#handle(JSON.parse(body))
-      } catch (error) {
-        if (this.#options.debug) console.error(`[lsp:${this.id}] bad message: ${errorMessage(error)}`)
       }
+    } catch (error) {
+      this.#protocolError(error)
     }
   }
 
-  #handle(message: any): void {
-    if (!message || typeof message !== "object") return
+  #handle(value: unknown): void {
+    const message = record(value)
+    if (!message || message.jsonrpc !== "2.0") throw new Error("invalid JSON-RPC envelope")
     this.#options.onActivity()
     if (message.id !== undefined && message.method === undefined) {
+      if (typeof message.id !== "number") throw new Error("invalid response ID")
       const pending = this.#pending.get(message.id)
       if (!pending) return
+      const error = record(message.error)
+      if (message.error !== undefined && (!error || typeof error.message !== "string" || typeof error.code !== "number")) {
+        throw new Error("invalid error response")
+      }
+      let result = message.result
+      if (pending.method === "textDocument/diagnostic" && !error) {
+        result = diagnosticReport(result)
+      }
       pending.cleanup()
       this.#pending.delete(message.id)
-      if (message.error) pending.reject(new LspError(`${this.id}: ${message.error.message ?? "request failed"}`, message.error.code))
-      else pending.resolve(message.result)
+      if (error) pending.reject(new LspError(`${this.id}: ${error.message}`, error.code as number))
+      else pending.resolve(result)
       return
     }
+    if (typeof message.method !== "string") throw new Error("invalid request method")
     if (message.method === "textDocument/publishDiagnostics") {
-      const params = message.params ?? {}
-      this.#options.onDiagnostics(
-        String(params.uri ?? ""),
-        Array.isArray(params.diagnostics) ? params.diagnostics : [],
-        typeof params.version === "number" ? params.version : undefined,
-      )
+      const params = record(message.params)
+      if (!params || typeof params.uri !== "string" ||
+          (params.version !== undefined && !Number.isSafeInteger(params.version))) throw new Error("invalid diagnostics parameters")
+      this.#options.onDiagnostics(params.uri, diagnostics(params.diagnostics), params.version as number | undefined)
       return
     }
     if (message.id !== undefined) this.#respond(message.id, message.method, message.params)
@@ -288,7 +373,7 @@ export class LspClient {
     this.#child = undefined
     this.#rejectPending(new Error(`${this.id}: server exited (${code ?? signal})`))
     if (!this.#stopping && this.#options.debug) console.error(`[lsp:${this.id}] exited (${code ?? signal})`)
-    this.#options.onExit()
+    this.#options.onExit(this.#failed)
   }
 }
 

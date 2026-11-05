@@ -1,10 +1,11 @@
-import { access, open, readFile, realpath, stat } from "node:fs/promises"
-import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path"
+import { createRequire } from "node:module"
+import { access, lstat, open, readFile, readlink, realpath } from "node:fs/promises"
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 import { abortable } from "./cancellation.ts"
 import { BUILTIN_ROOTS, languageIdForExtension } from "./catalog.ts"
-import { LspClient, LspError, errorMessage, type Diagnostic } from "./client.ts"
+import { LspClient, LspError, errorMessage, record, type Diagnostic } from "./client.ts"
 import type { ServerConfig, Settings } from "./config.ts"
 
 // After the first fresh push, a server that stays quiet this long is done publishing for now.
@@ -65,23 +66,33 @@ export async function insideProject(root: string, file: string): Promise<boolean
 }
 
 /**
- * Reads a project file, checking the file that was opened rather than the path,
- * so a symlink swapped between the check and the read cannot send outside contents.
+ * Reads a project file, checking the file that was opened rather than the path.
+ * Linux names an open descriptor's file under /proc, so no symlink swap can get
+ * outside contents past the check. Elsewhere the opened inode must still sit at
+ * the resolved path, which a racing swap of a parent directory could defeat.
  */
 async function readInside(root: string, file: string): Promise<string> {
   const outside = new Error(`${file} is outside the project directory ${root}.`)
   if (!within(root, file)) throw outside
   const handle = await open(file, "r")
   try {
-    const opened = await handle.stat()
-    const real = await realpath(file)
-    const current = await stat(real)
+    const opened = await readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined)
+    const real = opened ?? (await realpath(file))
     if (!within(await realpath(root).catch(() => root), real)) throw outside
-    if (current.dev !== opened.dev || current.ino !== opened.ino) throw outside
+    if (opened === undefined) {
+      const [held, current] = await Promise.all([handle.stat(), lstat(real)])
+      if (current.dev !== held.dev || current.ino !== held.ino) throw outside
+    }
     return await handle.readFile("utf8")
   } finally {
     await handle.close()
   }
+}
+
+/** A tool's file argument as an absolute path, without OpenCode's `@` file-reference prefix. */
+export function projectPath(root: string, value: string): string {
+  const path = value.replace(/^@/, "")
+  return isAbsolute(path) ? resolve(path) : resolve(root, path)
 }
 
 export function within(root: string, file: string): boolean {
@@ -111,9 +122,15 @@ async function nearest(file: string, stop: string, markers: string[]): Promise<s
 
 /** The nearest directory from the crate up to the project whose Cargo.toml declares a workspace, else the crate. */
 async function cargoWorkspace(crate: string, project: string): Promise<string> {
+  const { parse: parseToml } = createRequire(import.meta.url)("smol-toml")
   for (let dir = crate; ; dir = dirname(dir)) {
-    const manifest = await readFile(join(dir, "Cargo.toml"), "utf8").catch(() => "")
-    if (manifest.includes("[workspace]")) return dir
+    let manifest: string | undefined
+    try {
+      manifest = await readFile(join(dir, "Cargo.toml"), "utf8")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+    if (manifest !== undefined && record(parseToml(manifest).workspace)) return dir
     if (dir === project || dir === dirname(dir)) return crate
   }
 }
@@ -238,12 +255,16 @@ export class LspManager {
   /** Sync the file and wait for its diagnostics. */
   async diagnostics(file: string, timeoutMs = this.#settings.diagnosticsTimeoutMs, signal?: AbortSignal): Promise<FileDiagnostics> {
     signal?.throwIfAborted()
-    const uri = pathToFileURL(file).href
     const synced = await this.sync(file, signal).catch((error) => {
       signal?.throwIfAborted()
       this.#log(`${file}: ${errorMessage(error)}`)
       return []
     })
+    return this.#reports(file, synced, timeoutMs, signal)
+  }
+
+  async #reports(file: string, synced: Synced[], timeoutMs: number, signal?: AbortSignal): Promise<FileDiagnostics> {
+    const uri = pathToFileURL(file).href
     // Reports from before this file's contents reached the server describe older contents.
     const reports = await Promise.all(synced.map(({ client, version, sentAt }) => this.#collect(client, uri, version, sentAt, timeoutMs, signal)))
     signal?.throwIfAborted()
@@ -278,12 +299,11 @@ export class LspManager {
           const report = await response
           if (this.#deleted.has(uri)) return undefined
           if (sent === undefined || this.#versions.get(uri) !== sent) continue
-          if (report?.kind === "full" && Array.isArray(report.items)) {
+          if (report.kind === "full") {
             this.#store(client.id, uri, report.items, sent)
             return report.items
           }
-          if (report?.kind === "unchanged") return this.#published.get(client.id)?.get(uri)?.diagnostics
-          break
+          return this.#published.get(client.id)?.get(uri)?.diagnostics
         }
       } catch (error) {
         signal?.throwIfAborted()
@@ -345,8 +365,9 @@ export class LspManager {
     const targets = await abortable(this.#targets(file), signal)
     if (targets.length === 0) throw new Error("No configured LSP server applies to this file's project.")
     const cold = targets.some((target) => !this.#entries.get(target.key)?.warmed)
-    if (cold) await this.diagnostics(file, WARMUP_TIMEOUT_MS, signal)
-    else await this.sync(file, signal)
+    // Unlike a hook's check, a query must not go ahead for a file that could not be synced.
+    const synced = await this.sync(file, signal)
+    if (cold) await this.#reports(file, synced, WARMUP_TIMEOUT_MS, signal)
     signal?.throwIfAborted()
     const clients: LspClient[] = []
     for (const target of targets) {
@@ -372,6 +393,7 @@ export class LspManager {
       entry = { opened: new Set() }
       this.#entries.set(key, entry)
     }
+    if (entry.client?.failure) entry.broken = entry.client.failure.message
     if (entry.broken) throw new Error(entry.broken)
     if (entry.client?.running) return entry.client
     if (entry.starting) return entry.starting
@@ -390,7 +412,8 @@ export class LspManager {
       requestTimeoutMs: this.#settings.requestTimeoutMs,
       onDiagnostics: (uri, diagnostics, version) => this.#store(key, uri, diagnostics, version),
       onActivity: () => this.#notify(key),
-      onExit: () => {
+      onExit: (failure) => {
+        if (failure) current.broken = failure.message
         if (current.client === client) current.client = undefined
       },
       debug: this.#settings.debug,

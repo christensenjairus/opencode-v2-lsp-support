@@ -1,10 +1,9 @@
 import { stat } from "node:fs/promises"
-import { isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Diagnostic } from "./client.ts"
 import { isRecord } from "./config.ts"
 import { diagnosticsReport, displayPath, errorsOnly } from "./format.ts"
-import { insideProject, type LspManager } from "./manager.ts"
+import { insideProject, projectPath, type LspManager } from "./manager.ts"
 
 const MUTATING_TOOLS = new Set(["write", "edit", "patch", "apply_patch"])
 const MAX_OTHER_FILES = 5
@@ -41,7 +40,7 @@ async function checkable(manager: LspManager, root: string, files: string[]): Pr
 
 function warm(manager: LspManager, root: string, input: unknown): void {
   if (!isRecord(input) || typeof input.path !== "string") return
-  const file = absolute(root, input.path)
+  const file = projectPath(root, input.path)
   void checkable(manager, root, [file])
     .then(async ([inside]) => (inside && (await stat(inside)).isFile() ? manager.sync(inside) : undefined))
     .catch(() => undefined)
@@ -66,7 +65,7 @@ async function report(manager: LspManager, root: string, event: Completed, chang
     shown[displayPath(file, root)] = errors
   }
   if (isRecord(event.input) && typeof event.input.path === "string") {
-    const errors = shown[absolute(root, event.input.path)]
+    const errors = shown[projectPath(root, event.input.path)]
     if (errors) shown[event.input.path] = errors
   }
 
@@ -80,9 +79,8 @@ async function report(manager: LspManager, root: string, event: Completed, chang
       continue // untitled: and other non-file URIs have no path to report
     }
     if (files.includes(file)) continue
-    if (!(await insideProject(root, file))) continue
     const block = diagnosticsReport(file, diagnostics)
-    if (block) elsewhere.push(block)
+    if (block && await insideProject(root, file)) elsewhere.push(block)
   }
   if (elsewhere.length) sections.push(`LSP errors detected in other files:\n${elsewhere.join("\n")}`)
   if (sections.length === 0) return
@@ -102,7 +100,7 @@ export function touchedFiles(event: Completed, root: string): { changed: string[
   const deleted: string[] = []
   const add = (list: string[], value: unknown) => {
     if (typeof value !== "string" || value === "") return
-    const file = absolute(root, value)
+    const file = projectPath(root, value)
     if (!list.includes(file)) list.push(file)
   }
   const output = event.result.output
@@ -121,7 +119,7 @@ export function touchedFiles(event: Completed, root: string): { changed: string[
     // A moved file's result names only its destination, so the source comes from the patch text.
     if (typeof event.input.patchText === "string") {
       for (const [, source] of event.input.patchText.matchAll(/^\*\*\* Update File: (.+?)\r?\n\*\*\* Move to: /gm)) {
-        if (!changed.includes(absolute(root, source.trim()))) add(deleted, source.trim())
+        if (!changed.includes(projectPath(root, source.trim()))) add(deleted, source.trim())
       }
     }
   }
@@ -133,9 +131,4 @@ function append(result: Completed["result"], text: string): void {
   else if (Array.isArray(result.content)) result.content = [...result.content, { type: "text", text }]
   else if (typeof result.output === "string") result.output += text
   else result.content = text.trimStart()
-}
-
-function absolute(root: string, value: string): string {
-  const path = value.replace(/^@/, "")
-  return isAbsolute(path) ? resolve(path) : resolve(root, path)
 }

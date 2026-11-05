@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Usage: test-opencode-lsp.js [plugin-dir]
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import { once } from "node:events"
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
+import { promisify } from "node:util"
 
 const PLUGIN = pathToFileURL(resolve(process.argv[2] ?? new URL(".", import.meta.url).pathname) + "/")
 const { default: plugin } = await import(new URL("index.ts", PLUGIN))
@@ -37,6 +38,10 @@ const diagnose = (text) =>
     return [{ range: { start: { line: index, character }, end: { line: index, character: character + 1 } }, severity, message: "bad " + index }]
   })
 const changed = (uri, version, text) => {
+  if (process.env.FAKE_BAD_DIAGNOSTICS) {
+    send({ method: "textDocument/publishDiagnostics", params: { uri, version, diagnostics: [null] } })
+    return
+  }
   documents.set(uri, text)
   if (pull || text.includes("SILENT")) return
   setTimeout(() => {
@@ -888,6 +893,247 @@ test("settings follow OpenCode 2's config precedence and deep merge, then plugin
     )
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("Cargo roots use TOML tables and reject malformed manifests", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-cargo-")))
+  try {
+    await mkdir(join(root, "member", "src"), { recursive: true })
+    const file = join(root, "member", "src", "lib.rs")
+    await writeFile(join(root, "member", "Cargo.toml"), '# [workspace]\n[package]\nname = "member"\n')
+    await writeFile(join(root, "Cargo.toml"), '[ workspace ]\nmembers = ["member"]\n')
+    assert.equal(await serverRoot("rust", file, root), root)
+    await writeFile(join(root, "Cargo.toml"), '[workspace\n')
+    await assert.rejects(serverRoot("rust", file, root))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("loading the manager without a Rust parser leaves other languages available", async () => {
+  const root = await mkdtemp(join(tmpdir(), "opencode-lsp-no-parser-"))
+  try {
+    await cp(new URL("src/", PLUGIN), join(root, "src"), { recursive: true })
+    await writeFile(join(root, "package.json"), '{"type":"module"}')
+    await writeFile(join(root, "Cargo.toml"), "[workspace]\n")
+    const driver = `
+      import assert from "node:assert/strict"
+      import { serverRoot } from ${JSON.stringify(pathToFileURL(join(root, "src/manager.ts")).href)}
+      assert.equal(await serverRoot("custom", ${JSON.stringify(join(root, "a.ts"))}, ${JSON.stringify(root)}), ${JSON.stringify(root)})
+      await assert.rejects(serverRoot("rust", ${JSON.stringify(join(root, "lib.rs"))}, ${JSON.stringify(root)}), { code: "MODULE_NOT_FOUND" })
+    `
+    await promisify(execFile)(process.execPath, ["--input-type=module", "-e", driver], { timeout: 15000, env: { ...process.env, NODE_PATH: "" } })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("malformed framing and diagnostics terminate the client instead of retaining or publishing them", async () => {
+  const { LspClient } = await import(new URL("src/client.ts", PLUGIN))
+  const frames = [
+    "x".repeat(8196),
+    "Content-Length: 16777217\r\n\r\n",
+    "Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+    "Content-Length: 9007199254740992\r\n\r\n",
+    ...[
+      { method: "textDocument/publishDiagnostics", params: { uri: "file:///bad", diagnostics: [null] } },
+      { id: 2, result: { kind: "full", items: [{ message: "bad", range: {} }] } },
+    ].map((message) => {
+      const body = JSON.stringify({ jsonrpc: "2.0", ...message })
+      return `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+    }),
+  ]
+  for (const frame of frames) {
+    let published = false
+    const pull = frame.includes('"kind":"full"')
+    const script = pull
+      ? `let initialized = false; process.stdin.on("data", (chunk) => {
+          if (!initialized) { initialized = true; const body = JSON.stringify({jsonrpc:"2.0",id:1,result:{capabilities:{}}});
+            process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body);
+          } else if (chunk.includes("textDocument/diagnostic")) process.stdout.write(${JSON.stringify(frame)});
+        }); setInterval(() => {}, 1000)`
+      : `process.stdin.once("data", () => process.stdout.write(${JSON.stringify(frame)})); setInterval(() => {}, 1000)`
+    const client = new LspClient({ id: "bad", command: [process.execPath, "-e",
+      script],
+      root: process.cwd(), rootUri: "file:///", env: {}, initializeTimeoutMs: 5000, requestTimeoutMs: 5000,
+      onDiagnostics: () => { published = true }, onActivity: () => {}, onExit: () => {}, debug: false })
+    try {
+      if (pull) {
+        await client.start()
+        await assert.rejects(client.request("textDocument/diagnostic", {}), /protocol error/)
+      } else await assert.rejects(client.start(), /protocol error/)
+      assert.equal(published, false)
+      assert.equal(client.running, false)
+    } finally {
+      await client.stop()
+    }
+  }
+})
+
+test("framing accepts coalesced legal messages and graceful shutdown consumes its reply", async () => {
+  const driver = String.raw`
+    import assert from "node:assert/strict"
+    import { EventEmitter } from "node:events"
+    import { Writable, PassThrough } from "node:stream"
+    import { mock } from "node:test"
+    const child = new EventEmitter()
+    child.exitCode = null
+    child.signalCode = null
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => { child.signalCode = "SIGKILL"; child.emit("exit", null, "SIGKILL") }
+    let exitSeen = false
+    let published = 0
+    const frame = (message) => {
+      const body = JSON.stringify({jsonrpc: "2.0", ...message})
+      return Buffer.from("Content-Length: " + Buffer.byteLength(body) + "\r\n\r\n" + body)
+    }
+    child.stdin = new Writable({write(data, _encoding, done) {
+      const request = JSON.parse(data.toString().split("\r\n\r\n")[1])
+      if (request.method === "initialize") child.stdout.emit("data", frame({id: request.id, result: {capabilities: {}}}))
+      if (request.method === "workspace/symbol") {
+        const first = frame({id: request.id, result: "x".repeat(16 * 1024 * 1024 - 1024)})
+        const second = frame({method: "textDocument/publishDiagnostics", params: {
+          uri: "file:///inside", diagnostics: [], padding: "x".repeat(32 * 1024)}})
+        child.stdout.emit("data", first.subarray(0, first.length - 1024))
+        child.stdout.emit("data", Buffer.concat([first.subarray(first.length - 1024), second]))
+      }
+      if (request.method === "shutdown") child.stdout.emit("data", frame({id: request.id, result: null}))
+      if (request.method === "exit") { exitSeen = true; child.exitCode = 0; child.emit("exit", 0, null) }
+      done()
+    }})
+    mock.module("node:child_process", {namedExports: {spawn: () => {
+      queueMicrotask(() => child.emit("spawn"))
+      return child
+    }}})
+    const { LspClient } = await import(new URL("src/client.ts", process.argv[1]))
+    const client = new LspClient({id: "framing", command: ["fixture"], root: process.cwd(), rootUri: "file:///",
+      env: {}, initializeTimeoutMs: 5000, requestTimeoutMs: 5000,
+      onDiagnostics: () => { published++ }, onActivity: () => {}, onExit: () => {}, debug: false})
+    await client.start()
+    try {
+      const result = await client.request("workspace/symbol", {})
+      assert.equal(result.length, 16 * 1024 * 1024 - 1024)
+      assert.equal(published, 1)
+      const body = JSON.stringify({jsonrpc: "2.0", method: "textDocument/publishDiagnostics",
+        params: {uri: "file:///inside", diagnostics: []}})
+      const prefix = "Content-Length: " + Buffer.byteLength(body) + "\r\nX-Padding: "
+      const header = prefix + "x".repeat(8192 - prefix.length)
+      child.stdout.emit("data", Buffer.from(header + "\r\n"))
+      child.stdout.emit("data", Buffer.from("\r\n" + body))
+      assert.equal(published, 2)
+      mock.timers.enable({apis: ["setTimeout"]})
+      const stopping = client.stop()
+      await new Promise(setImmediate)
+      try {
+        assert.equal(exitSeen, true, "shutdown must not need its timeout before sending exit")
+      } finally {
+        mock.timers.tick(3000)
+        await stopping
+        mock.timers.reset()
+      }
+    } finally {
+      await client.stop()
+    }
+  `
+  await promisify(execFile)(process.execPath, ["--experimental-test-module-mocks", "--input-type=module", "-e", driver,
+    PLUGIN.href], {timeout: 15000})
+})
+
+test("a server that violates the diagnostic protocol stays disabled across edits", async () => {
+  const root = await project({fake: {command: ["FAKE"], extensions: [".ts"],
+    env: {FAKE_BAD_DIAGNOSTICS: "1", FAKE_LOG: "LOG"}}})
+  const log = join(root, "lsp.log")
+  const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+  config.lsp.fake.env.FAKE_LOG = log
+  await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+  const manager = new LspManager(resolveSettings(root, {}, {OPENCODE_CONFIG_DIR: join(root, "no-global")}), root)
+  try {
+    const file = join(root, "a.ts")
+    await writeFile(file, "inside")
+    const [{client}] = await manager.sync(file)
+    await assert.rejects(client.request("textDocument/hover", {textDocument: {uri: pathToFileURL(file).href},
+      position: {line: 0, character: 0}}), /protocol error/)
+    assert.deepEqual(await manager.sync(file), [])
+    await client.stop()
+    assert.deepEqual(await manager.sync(file), [])
+    const entries = (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse)
+    assert.equal(entries.filter((entry) => entry.method === "initialize").length, 1)
+    await assert.rejects(manager.request(file, "hoverProvider", (client) => client.request("textDocument/hover", {})), /protocol error/)
+  } finally {
+    await manager.shutdown()
+    await rm(root, {recursive: true, force: true})
+  }
+})
+
+test("a query stops when its file cannot be synced, even with a cold server already running", async () => {
+  const root = await project(structuredClone(FAKE))
+  const manager = new LspManager(resolveSettings(root, {}, { OPENCODE_CONFIG_DIR: join(root, "no-global") }), root)
+  const outside = await realpath(await mkdtemp(join(tmpdir(), "opencode-lsp-outside-")))
+  try {
+    await writeFile(join(root, "a.ts"), "inside\n")
+    await writeFile(join(outside, "secret.ts"), "OUTSIDE\n")
+    await manager.sync(join(root, "a.ts"))
+    // The tool already checked the path; this is what the manager sees if it was swapped since.
+    let sent = false
+    await assert.rejects(manager.request(join(outside, "secret.ts"), "hoverProvider", async () => (sent = true)), /outside the project/)
+    assert.equal(sent, false, "no request may reach a server for a file that failed to sync")
+  } finally {
+    await manager.shutdown()
+    await rm(root, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode file references strip @ for both diagnostics hooks and explicit queries", async () => {
+  const root = await project(structuredClone(FAKE))
+  const { after, lsp, cleanup } = await start(root)
+  try {
+    await writeFile(join(root, "a.ts"), "ERROR here\n")
+    const event = completed("edit", { path: "@a.ts" }, { content: "Edited a.ts" })
+    await after(event)
+    assert.match(event.result.content, /ERROR \[1:1\]/)
+    assert.match(event.result.content, /^Edited a.ts\n\nLSP errors/)
+    assert.equal(event.result.metadata.diagnostics["@a.ts"].length, 1)
+    assert.equal(
+      (await lsp.execute({ operation: "hover", path: "@a.ts", line: 1, character: 1 }, {})).content,
+      "hover 0:0",
+    )
+  } finally {
+    await cleanup()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("cancelling diagnostic warmup releases push and pull waits without leaving stale reports", async () => {
+  for (const pull of [false, true]) {
+    const root = await project({ fake: { command: ["FAKE"], extensions: [".ts"], env: { FAKE_PULL: pull ? "1" : "0" } } })
+    const log = join(root, "server.log")
+    const config = JSON.parse(await readFile(join(root, "opencode.json"), "utf8"))
+    config.lsp.fake.env.FAKE_LOG = log
+    await writeFile(join(root, "opencode.json"), JSON.stringify(config))
+    const { lsp, after, cleanup } = await start(root)
+    try {
+      await writeFile(join(root, "a.ts"), pull ? "ERROR SLOWPULL\n" : "SILENT\n")
+      const controller = new AbortController()
+      const pending = lsp.execute({ operation: "documentSymbol", path: "a.ts" }, { signal: controller.signal })
+      const rejected = assert.rejects(pending, { name: "AbortError" })
+      await waitForLog(log, pull ? "textDocument/diagnostic" : "textDocument/didOpen")
+      const began = Date.now()
+      controller.abort()
+      await rejected
+      assert.ok(Date.now() - began < 1_000)
+      if (pull) await waitForLog(log, "$/cancelRequest")
+      await writeFile(join(root, "a.ts"), "fine\n")
+      const event = completed("edit", { path: "a.ts" }, { content: "Edited a.ts" })
+      await after(event)
+      assert.equal(event.result.content, "Edited a.ts")
+      assert.match((await lsp.execute({ operation: "documentSymbol", path: "a.ts" }, {})).content, /Outer/)
+    } finally {
+      await cleanup()
+      await rm(root, { recursive: true, force: true })
+    }
   }
 })
 
