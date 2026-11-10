@@ -125,6 +125,10 @@ export class LspClient {
       cwd: this.#options.root,
       env: { ...process.env, ...this.#options.env },
       stdio: ["pipe", "pipe", "pipe"],
+      // Without this, spawning from a GUI process (e.g. the opencode Desktop app,
+      // which has no console) gives every language server a visible console
+      // window on Windows.
+      windowsHide: true,
     })
     this.#child = child
     child.stdout?.on("data", (chunk: Buffer) => this.#onData(chunk))
