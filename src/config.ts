@@ -89,7 +89,9 @@ export function configDocuments(directory: string, env: NodeJS.ProcessEnv): Reco
 
 function parseDocument(text: string, source: string, dir: string, env: NodeJS.ProcessEnv): Record<string, unknown> | undefined {
   try {
-    const parsed = parseJsonc(substitute(text, dir, env))
+    // Windows editors (and opencode Desktop) often save config files with a UTF-8
+    // BOM, which JSON.parse rejects; strip it before parsing.
+    const parsed = parseJsonc(substitute(text.replace(/^\uFEFF/, ""), dir, env))
     return isRecord(parsed) ? parsed : undefined
   } catch (error) {
     console.error(`[lsp] cannot parse ${source}: ${error instanceof Error ? error.message : String(error)}`)
